@@ -15,6 +15,7 @@ import csv
 import logging
 import re
 import time
+from collections import deque
 from collections.abc import Iterable
 from dataclasses import dataclass
 from html import unescape
@@ -63,22 +64,37 @@ class MKBScraper:
     def scrape(self) -> list[MKBEntry]:
         """Scrape every discoverable MKB entry from the site."""
 
-        LOGGER.info("Fetching index page: %s", self.index_url)
-        index_html = self._fetch(self.index_url)
-        soup = BeautifulSoup(index_html, "html.parser")
-
         entries: list[MKBEntry] = []
-        entries.extend(self._parse_entries(soup))
+        visited: set[str] = set()
+        to_visit: deque[str] = deque([self.index_url])
+        discovered: set[str] = {self.index_url.rstrip("/") or self.index_url}
 
-        pages = self._discover_detail_pages(soup)
-        LOGGER.info("Discovered %d detail pages", len(pages))
-        for page_url in pages:
-            LOGGER.info("Fetching detail page: %s", page_url)
+        while to_visit:
+            page_url = to_visit.popleft()
+            if page_url in visited:
+                continue
+
+            LOGGER.info("Fetching page: %s", page_url)
             html = self._fetch(page_url)
-            page_entries = self._parse_entries(BeautifulSoup(html, "html.parser"))
+            soup = BeautifulSoup(html, "html.parser")
+
+            page_entries = self._parse_entries(soup)
             LOGGER.debug("Found %d entries on %s", len(page_entries), page_url)
             entries.extend(page_entries)
-            if self.delay:
+
+            visited.add(page_url)
+
+            new_links = self._discover_detail_pages(soup, page_url)
+            LOGGER.debug(
+                "Discovered %d child pages from %s", len(new_links), page_url
+            )
+            for link in new_links:
+                normalized_link = link.rstrip("/") or link
+                if normalized_link not in discovered:
+                    to_visit.append(link)
+                    discovered.add(normalized_link)
+
+            if self.delay and to_visit:
                 time.sleep(self.delay)
 
         unique_entries = _deduplicate(entries)
@@ -90,24 +106,55 @@ class MKBScraper:
         resp.raise_for_status()
         return resp.text
 
-    def _discover_detail_pages(self, soup: BeautifulSoup) -> list[str]:
+    def _discover_detail_pages(self, soup: BeautifulSoup, current_url: str) -> list[str]:
         links: set[str] = set()
+        index_path = self.index_path.rstrip("/")
+        base_netloc = urlparse(self.base_url).netloc
+        current_normalized = current_url.rstrip("/")
+
+        def normalize(candidate: str) -> str | None:
+            parsed = urlparse(candidate)
+            if parsed.scheme not in {"http", "https"}:
+                return None
+            if parsed.netloc != base_netloc:
+                return None
+            path = parsed.path.rstrip("/")
+            if not path:
+                return None
+            if path == index_path and not parsed.query:
+                return None
+            if not path.startswith(index_path):
+                return None
+            normalized_url = f"{parsed.scheme}://{parsed.netloc}{path}"
+            if parsed.query:
+                normalized_url = f"{normalized_url}?{parsed.query}"
+            if normalized_url.rstrip("/") == current_normalized:
+                return None
+            return normalized_url
+
+        base_candidates: list[str] = []
+        seen_bases: set[str] = set()
+        for raw_base in (
+            current_url,
+            f"{self.base_url}{index_path}/",
+        ):
+            parsed_base = urlparse(raw_base)
+            base = f"{parsed_base.scheme}://{parsed_base.netloc}{parsed_base.path}"
+            if not base.endswith("/"):
+                base = f"{base}/"
+            if base not in seen_bases:
+                base_candidates.append(base)
+                seen_bases.add(base)
+
         for anchor in soup.find_all("a", href=True):
             href = anchor["href"].strip()
             if not href or href.startswith("#"):
                 continue
-            absolute = urljoin(self.index_url, href)
-            parsed = urlparse(absolute)
-            if parsed.scheme not in {"http", "https"}:
-                continue
-            if parsed.netloc != urlparse(self.base_url).netloc:
-                continue
-            path = parsed.path.rstrip("/")
-            if path in {self.index_path.rstrip("/"), f"{self.index_path.rstrip('/')}/"}:
-                continue
-            if not path.startswith(self.index_path.rstrip("/")):
-                continue
-            links.add(f"{parsed.scheme}://{parsed.netloc}{path}")
+            for base in base_candidates:
+                absolute = urljoin(base, href)
+                normalized = normalize(absolute)
+                if normalized is not None:
+                    links.add(normalized)
         return sorted(links)
 
     def _parse_entries(self, soup: BeautifulSoup) -> list[MKBEntry]:
