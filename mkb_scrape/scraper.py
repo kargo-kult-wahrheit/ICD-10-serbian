@@ -107,7 +107,7 @@ class MKBScraper:
         return resp.text
 
     def _collect_catalog_urls(self, soup: BeautifulSoup) -> list[str]:
-        catalog_urls: list[str] = []
+        candidates: list[tuple[str, str]] = []
         seen: set[str] = set()
         base_netloc = urlparse(self.base_url).netloc
 
@@ -131,11 +131,52 @@ class MKBScraper:
             if parsed.query:
                 normalized = f"{normalized}?{parsed.query}"
 
-            if normalized not in seen:
-                catalog_urls.append(normalized)
-                seen.add(normalized)
+            if normalized in seen:
+                continue
 
-        return sorted(catalog_urls)
+            seen.add(normalized)
+            candidates.append((normalized, path))
+
+        return self._filter_catalog_urls(candidates)
+
+    def _filter_catalog_urls(self, candidates: list[tuple[str, str]]) -> list[str]:
+        catalog_urls: list[str] = []
+        covered_ranges: list[
+            tuple[tuple[str, int, str], tuple[str, int, str], str, str]
+        ] = []
+
+        for url, path in candidates:
+            should_skip = False
+            code_range = _extract_code_range(path, self.catalog_path_prefix)
+            if code_range:
+                start, end = code_range
+                start_key = _code_sort_key(start)
+                end_key = _code_sort_key(end)
+                if start_key > end_key:
+                    start, end = end, start
+                    start_key, end_key = end_key, start_key
+
+                for existing_start_key, existing_end_key, existing_start, existing_end in covered_ranges:
+                    if existing_start_key <= start_key and end_key <= existing_end_key:
+                        LOGGER.debug(
+                            "Skipping %s because range %s-%s is covered by %s-%s",
+                            url,
+                            start,
+                            end,
+                            existing_start,
+                            existing_end,
+                        )
+                        should_skip = True
+                        break
+
+                if should_skip:
+                    continue
+
+                covered_ranges.append((start_key, end_key, start, end))
+
+            catalog_urls.append(url)
+
+        return catalog_urls
 
     def _parse_entries(self, soup: BeautifulSoup) -> list[MKBEntry]:
         entries: list[MKBEntry] = []
@@ -245,6 +286,27 @@ def _normalize_text(value: str) -> str:
 
 def _is_code(value: str) -> bool:
     return bool(re.fullmatch(r"[A-Z]{1,2}\d{2}(?:\.[0-9A-Z]{1,4})?", value))
+
+
+_CODE_IN_PATH_PATTERN = re.compile(r"[A-Z]{1,2}\d{2}(?:\.[0-9A-Z]{1,4})?")
+
+
+def _extract_code_range(path: str, prefix: str) -> Optional[tuple[str, str]]:
+    if not path.startswith(prefix):
+        return None
+
+    remainder = path[len(prefix) :].strip("/")
+    if not remainder:
+        return None
+
+    codes = _CODE_IN_PATH_PATTERN.findall(remainder)
+    if not codes:
+        return None
+
+    if len(codes) == 1:
+        return (codes[0], codes[0])
+
+    return (codes[0], codes[-1])
 
 
 def _deduplicate(entries: Iterable[MKBEntry]) -> list[MKBEntry]:
