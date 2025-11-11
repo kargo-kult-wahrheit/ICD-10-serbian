@@ -78,8 +78,14 @@ class MKBScraper:
         index_html = self._fetch(self.index_url)
         index_soup = BeautifulSoup(index_html, "html.parser")
 
-        index_entries = self._parse_entries(index_soup)
-        LOGGER.debug("Found %d entries directly on the index page", len(index_entries))
+        index_entries = self._parse_entries(index_soup, source=self.index_url)
+        LOGGER.info(
+            "Found %d entries directly on the index page", len(index_entries)
+        )
+        if not index_entries:
+            raise RuntimeError(
+                "No entries parsed from the index page. Aborting as requested."
+            )
         entries.extend(index_entries)
 
         catalog_pages = self._collect_catalog_urls(index_soup)
@@ -90,8 +96,12 @@ class MKBScraper:
             html = self._fetch(page_url)
             soup = BeautifulSoup(html, "html.parser")
 
-            page_entries = self._parse_entries(soup)
-            LOGGER.debug("Found %d entries on %s", len(page_entries), page_url)
+            page_entries = self._parse_entries(soup, source=page_url)
+            if not page_entries:
+                raise RuntimeError(
+                    f"No entries parsed from {page_url}. Aborting as requested."
+                )
+            LOGGER.info("Found %d entries on %s", len(page_entries), page_url)
             entries.extend(page_entries)
 
             if self.delay and idx < len(catalog_pages):
@@ -146,8 +156,9 @@ class MKBScraper:
 
             seen.add(normalized)
             candidates.append((normalized, path))
+            LOGGER.info("Discovered catalogue link: %s", normalized)
 
-        LOGGER.debug("Identified %d candidate catalogue links", len(candidates))
+        LOGGER.info("Identified %d candidate catalogue links", len(candidates))
         return self._filter_catalog_urls(candidates)
 
     def _filter_catalog_urls(self, candidates: list[tuple[str, str]]) -> list[str]:
@@ -169,7 +180,7 @@ class MKBScraper:
 
                 for existing_start_key, existing_end_key, existing_start, existing_end in covered_ranges:
                     if existing_start_key <= start_key and end_key <= existing_end_key:
-                        LOGGER.debug(
+                        LOGGER.info(
                             "Skipping %s because range %s-%s is covered by %s-%s",
                             url,
                             start,
@@ -186,39 +197,67 @@ class MKBScraper:
                 covered_ranges.append((start_key, end_key, start, end))
 
             catalog_urls.append(url)
+            LOGGER.info("Keeping catalogue URL: %s", url)
 
-        LOGGER.debug("Retained %d catalogue URLs after filtering", len(catalog_urls))
+        LOGGER.info("Retained %d catalogue URLs after filtering", len(catalog_urls))
         return catalog_urls
 
-    def _parse_entries(self, soup: BeautifulSoup) -> list[MKBEntry]:
+    def _parse_entries(self, soup: BeautifulSoup, *, source: str) -> list[MKBEntry]:
         entries: list[MKBEntry] = []
         parsed: list[MKBEntry] = []
 
         table_entries = self._parse_from_tables(soup)
-        LOGGER.debug("Parsed %d entries from HTML tables", len(table_entries))
+        LOGGER.info("Parsed %d entries from HTML tables on %s", len(table_entries), source)
         parsed.extend(table_entries)
 
         structured_entries = self._parse_from_structured_blocks(soup)
-        LOGGER.debug("Parsed %d entries from structured blocks", len(structured_entries))
+        LOGGER.info(
+            "Parsed %d entries from structured blocks on %s",
+            len(structured_entries),
+            source,
+        )
         parsed.extend(structured_entries)
 
         heading_entries = self._parse_from_heading_blocks(soup)
-        LOGGER.debug("Parsed %d entries from heading blocks", len(heading_entries))
+        LOGGER.info(
+            "Parsed %d entries from heading blocks on %s",
+            len(heading_entries),
+            source,
+        )
         parsed.extend(heading_entries)
 
         paragraph_entries = self._parse_from_paragraph_blocks(soup)
-        LOGGER.debug("Parsed %d entries from paragraph blocks", len(paragraph_entries))
+        LOGGER.info(
+            "Parsed %d entries from paragraph blocks on %s",
+            len(paragraph_entries),
+            source,
+        )
         parsed.extend(paragraph_entries)
 
         text_entries = self._parse_from_text_blocks(soup)
-        LOGGER.debug("Parsed %d entries from free text blocks", len(text_entries))
+        LOGGER.info(
+            "Parsed %d entries from free text blocks on %s",
+            len(text_entries),
+            source,
+        )
         parsed.extend(text_entries)
 
         meaningful = [_normalise_entry(entry) for entry in parsed]
         dropped = sum(1 for entry in meaningful if entry is None)
         if dropped:
-            LOGGER.debug("Dropped %d entries during normalisation", dropped)
-        return [entry for entry in meaningful if entry]
+            LOGGER.info(
+                "Dropped %d entries during normalisation on %s", dropped, source
+            )
+        final_entries = [entry for entry in meaningful if entry]
+        for entry in final_entries:
+            LOGGER.info(
+                "Created entry %s|%s|%s from %s",
+                entry.code,
+                entry.serbian,
+                entry.latin,
+                source,
+            )
+        return final_entries
 
     def _parse_from_tables(self, soup: BeautifulSoup) -> list[MKBEntry]:
         entries: list[MKBEntry] = []
@@ -376,6 +415,9 @@ def scrape_to_csv(output_path: str, *, delay: float = 0.2) -> int:
         writer = csv.writer(csv_file, delimiter="|")
         writer.writerow(["code", "description_serbian", "description_latin"])
         for entry in entries:
+            LOGGER.info(
+                "Writing entry to CSV: %s|%s|%s", entry.code, entry.serbian, entry.latin
+            )
             writer.writerow([entry.code, entry.serbian, entry.latin])
     LOGGER.info("Written %d entries to %s", len(entries), output_path)
     return len(entries)
@@ -477,6 +519,7 @@ def _deduplicate(entries: Iterable[MKBEntry]) -> list[MKBEntry]:
     for entry in entries:
         if entry.code not in seen:
             seen[entry.code] = entry
+            LOGGER.info("Registering new unique entry: %s", entry.code)
         else:
             existing = seen[entry.code]
             merged = MKBEntry(
@@ -485,6 +528,7 @@ def _deduplicate(entries: Iterable[MKBEntry]) -> list[MKBEntry]:
                 latin=entry.latin or existing.latin,
             )
             seen[entry.code] = merged
+            LOGGER.info("Merged duplicate entry for code %s", entry.code)
     return list(seen.values())
 
 
