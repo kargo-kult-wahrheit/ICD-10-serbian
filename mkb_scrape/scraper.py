@@ -79,14 +79,15 @@ class MKBScraper:
         index_soup = BeautifulSoup(index_html, "html.parser")
 
         index_entries = self._parse_entries(index_soup, source=self.index_url)
-        LOGGER.info(
-            "Found %d entries directly on the index page", len(index_entries)
-        )
-        if not index_entries:
-            raise RuntimeError(
-                "No entries parsed from the index page. Aborting as requested."
+        if index_entries:
+            LOGGER.info(
+                "Found %d entries directly on the index page", len(index_entries)
             )
-        entries.extend(index_entries)
+            entries.extend(index_entries)
+        else:
+            LOGGER.info(
+                "No entries parsed from the index page; continuing with catalogue pages"
+            )
 
         catalog_pages = self._collect_catalog_urls(index_soup)
         LOGGER.info("Discovered %d catalogue pages", len(catalog_pages))
