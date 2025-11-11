@@ -137,10 +137,8 @@ class MKBScraper:
 
         base_candidates: list[str] = []
         seen_bases: set[str] = set()
-        for raw_base in (
-            current_url,
-            f"{self.base_url}{index_path}/",
-        ):
+
+        def add_base(raw_base: str) -> None:
             parsed_base = urlparse(raw_base)
             base = f"{parsed_base.scheme}://{parsed_base.netloc}{parsed_base.path}"
             if not base.endswith("/"):
@@ -148,6 +146,16 @@ class MKBScraper:
             if base not in seen_bases:
                 base_candidates.append(base)
                 seen_bases.add(base)
+
+        # Always try the site root first so that relative links lacking a leading
+        # slash (e.g. "medjunarodna-klasifikacija-bolesti/A00") resolve
+        # correctly.  Some pages on stetoskop.info use such relative URLs, which
+        # would otherwise lead to duplicated path segments like
+        # ``.../medjunarodna-klasifikacija-bolesti/medjunarodna-klasifikacija-bolesti/...``
+        # when resolved against ``current_url``.
+        add_base(f"{self.base_url}/")
+        add_base(current_url)
+        add_base(f"{self.base_url}{index_path}/")
 
         for anchor in soup.find_all("a", href=True):
             href = anchor["href"].strip()
@@ -158,6 +166,7 @@ class MKBScraper:
                 normalized = normalize(absolute)
                 if normalized is not None:
                     links.add(normalized)
+                    break
         return sorted(links)
 
     def _parse_entries(self, soup: BeautifulSoup) -> list[MKBEntry]:
