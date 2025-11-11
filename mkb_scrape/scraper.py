@@ -22,7 +22,7 @@ from typing import Optional
 from urllib.parse import urljoin, urlparse
 
 import requests
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, NavigableString, Tag
 
 BASE_URL = "https://www.stetoskop.info"
 # Entry point for the ICD-10 catalogue on stetoskop.info. The portal recently
@@ -180,14 +180,14 @@ class MKBScraper:
 
     def _parse_entries(self, soup: BeautifulSoup) -> list[MKBEntry]:
         entries: list[MKBEntry] = []
-        entries.extend(self._parse_from_tables(soup))
-        if entries:
-            return entries
-        entries.extend(self._parse_from_structured_blocks(soup))
-        if entries:
-            return entries
-        entries.extend(self._parse_from_text_blocks(soup))
-        return entries
+        parsed: list[MKBEntry] = []
+        parsed.extend(self._parse_from_tables(soup))
+        parsed.extend(self._parse_from_structured_blocks(soup))
+        parsed.extend(self._parse_from_heading_blocks(soup))
+        parsed.extend(self._parse_from_paragraph_blocks(soup))
+        parsed.extend(self._parse_from_text_blocks(soup))
+        meaningful = [_normalise_entry(entry) for entry in parsed]
+        return [entry for entry in meaningful if entry]
 
     def _parse_from_tables(self, soup: BeautifulSoup) -> list[MKBEntry]:
         entries: list[MKBEntry] = []
@@ -214,7 +214,10 @@ class MKBScraper:
         candidates = soup.find_all(
             lambda tag: tag.name in {"div", "li"}
             and tag.get("class")
-            and any("mkb" in cls.lower() for cls in tag.get("class", []))
+            and any(
+                any(key in cls.lower() for key in ("mkb", "icd", "sifra", "šifra"))
+                for cls in tag.get("class", [])
+            )
         )
         for container in candidates:
             code_element = _find_first_matching(
@@ -223,7 +226,7 @@ class MKBScraper:
             )
             serbian_element = _find_first_matching(
                 container,
-                class_substrings=["sr", "opis", "naziv"],
+                class_substrings=["sr", "opis", "naziv", "title"],
                 exclude=code_element,
             )
             latin_element = _find_first_matching(
@@ -248,6 +251,58 @@ class MKBScraper:
             entries.append(MKBEntry(code_text, serbian_text, latin_text))
         return entries
 
+    def _parse_from_heading_blocks(self, soup: BeautifulSoup) -> list[MKBEntry]:
+        entries: list[MKBEntry] = []
+        heading_pattern = re.compile(
+            r"^(?P<code>[A-Z]{1,2}\d{2}(?:\.[0-9A-Z]{1,4})?)\s*[-–—:]?\s*(?P<serbian>.+)$"
+        )
+        for heading in soup.find_all(re.compile(r"^h[1-6]$")):
+            text = _normalize_text(heading.get_text(" ", strip=True))
+            if not text:
+                continue
+            match = heading_pattern.match(text)
+            if not match:
+                continue
+            code = match.group("code")
+            serbian = match.group("serbian").strip()
+            latin = _extract_following_latin(heading)
+            entries.append(MKBEntry(code, serbian, latin))
+        return entries
+
+    def _parse_from_paragraph_blocks(self, soup: BeautifulSoup) -> list[MKBEntry]:
+        entries: list[MKBEntry] = []
+        for paragraph in soup.find_all(["p", "li", "div"]):
+            strong = paragraph.find(["strong", "b"])
+            if not strong:
+                continue
+            code_text = _normalize_text(strong.get_text(" ", strip=True))
+            if not _is_code(code_text):
+                continue
+            serbian_parts: list[str] = []
+            latin_text = ""
+            for node in strong.next_siblings:
+                if isinstance(node, str):
+                    candidate = _normalize_text(node)
+                    if candidate:
+                        serbian_parts.append(candidate)
+                    continue
+                if node.name == "br":
+                    continue
+                text = _normalize_text(node.get_text(" ", strip=True))
+                if not text:
+                    continue
+                classes = " ".join(node.get("class", [])).lower()
+                if node.name in {"em", "i"} or "latin" in classes:
+                    latin_text = text
+                    break
+                if any(keyword in classes for keyword in ("lat", "latin")):
+                    latin_text = text
+                    break
+                serbian_parts.append(text)
+            serbian_text = _normalize_text(" ".join(part for part in serbian_parts if part))
+            entries.append(MKBEntry(code_text, serbian_text, latin_text))
+        return entries
+
     def _parse_from_text_blocks(self, soup: BeautifulSoup) -> list[MKBEntry]:
         text = soup.get_text("\n", strip=True)
         entries: list[MKBEntry] = []
@@ -258,9 +313,20 @@ class MKBScraper:
                 continue
             code = match.group("code")
             rest = match.group("rest")
-            parts = [part.strip() for part in re.split(r"\s{2,}\|\s{2,}|\s{2,}", rest) if part.strip()]
-            serbian = parts[0] if parts else ""
-            latin = parts[1] if len(parts) > 1 else ""
+            parts = [
+                part.strip()
+                for part in re.split(r"\s{2,}\|\s{2,}|\s{2,}|\s+-\s+|\s+–\s+", rest)
+                if part.strip()
+            ]
+            serbian = parts[0] if parts else rest.strip()
+            latin = ""
+            if len(parts) > 1:
+                latin = parts[1]
+            else:
+                latin_match = re.search(r"\(([^()]+)\)$", serbian)
+                if latin_match:
+                    latin = latin_match.group(1).strip()
+                    serbian = serbian[: latin_match.start()].strip()
             entries.append(MKBEntry(code, serbian, latin))
         return entries
 
@@ -286,6 +352,68 @@ def _normalize_text(value: str) -> str:
 
 def _is_code(value: str) -> bool:
     return bool(re.fullmatch(r"[A-Z]{1,2}\d{2}(?:\.[0-9A-Z]{1,4})?", value))
+
+
+def _normalise_entry(entry: MKBEntry) -> Optional[MKBEntry]:
+    serbian = _strip_labels(_normalize_text(entry.serbian))
+    latin = _strip_labels(_normalize_text(entry.latin))
+
+    if serbian and _is_code(serbian):
+        serbian = ""
+    if latin and _is_code(latin):
+        latin = ""
+
+    if not serbian and latin:
+        segments = [segment.strip() for segment in re.split(r"\s+-\s+|\s+–\s+", latin) if segment.strip()]
+        if len(segments) > 1:
+            serbian, latin = segments[0], segments[-1]
+
+    if not serbian:
+        return None
+
+    return MKBEntry(entry.code, serbian, latin)
+
+
+_LABEL_PATTERN = re.compile(
+    r"^(?:srpski|serbian|naziv|opis|latinski|latin(?: name)?)\s*[:\-–]?\s*",
+    re.IGNORECASE,
+)
+
+
+def _strip_labels(value: str) -> str:
+    if not value:
+        return ""
+    cleaned = _LABEL_PATTERN.sub("", value)
+    return cleaned.strip(" -:\u2013")
+
+
+def _extract_following_latin(element: Tag) -> str:
+    for idx, sibling in enumerate(element.next_siblings):
+        if idx > 10:
+            break
+        if isinstance(sibling, NavigableString):
+            candidate = _normalize_text(str(sibling))
+            if _contains_latin_label(candidate):
+                return _strip_labels(candidate)
+            continue
+        if not isinstance(sibling, Tag):
+            continue
+        if sibling.name == "br":
+            continue
+        text = _normalize_text(sibling.get_text(" ", strip=True))
+        if not text:
+            continue
+        classes = " ".join(sibling.get("class", [])).lower()
+        if sibling.name in {"em", "i"} or "latin" in classes or _contains_latin_label(text):
+            return _strip_labels(text)
+        if sibling.name and sibling.name.startswith("h"):
+            break
+    return ""
+
+
+def _contains_latin_label(value: str) -> bool:
+    value_lower = value.lower()
+    return any(token in value_lower for token in ("latinski", "latin"))
 
 
 _CODE_IN_PATH_PATTERN = re.compile(r"[A-Z]{1,2}\d{2}(?:\.[0-9A-Z]{1,4})?")
