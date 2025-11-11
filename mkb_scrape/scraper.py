@@ -99,9 +99,19 @@ class MKBScraper:
 
         unique_entries = _deduplicate(entries)
         LOGGER.info("Collected %d unique entries", len(unique_entries))
-        return sorted(unique_entries, key=lambda entry: _code_sort_key(entry.code))
+        ordered = sorted(unique_entries, key=lambda entry: _code_sort_key(entry.code))
+        if ordered:
+            sample = ordered[0]
+            LOGGER.debug(
+                "First entry after sorting: %s | %s | %s",
+                sample.code,
+                sample.serbian,
+                sample.latin,
+            )
+        return ordered
 
     def _fetch(self, url: str) -> str:
+        LOGGER.debug("Requesting %s", url)
         resp = self.session.get(url, timeout=30)
         resp.raise_for_status()
         return resp.text
@@ -137,6 +147,7 @@ class MKBScraper:
             seen.add(normalized)
             candidates.append((normalized, path))
 
+        LOGGER.debug("Identified %d candidate catalogue links", len(candidates))
         return self._filter_catalog_urls(candidates)
 
     def _filter_catalog_urls(self, candidates: list[tuple[str, str]]) -> list[str]:
@@ -176,17 +187,37 @@ class MKBScraper:
 
             catalog_urls.append(url)
 
+        LOGGER.debug("Retained %d catalogue URLs after filtering", len(catalog_urls))
         return catalog_urls
 
     def _parse_entries(self, soup: BeautifulSoup) -> list[MKBEntry]:
         entries: list[MKBEntry] = []
         parsed: list[MKBEntry] = []
-        parsed.extend(self._parse_from_tables(soup))
-        parsed.extend(self._parse_from_structured_blocks(soup))
-        parsed.extend(self._parse_from_heading_blocks(soup))
-        parsed.extend(self._parse_from_paragraph_blocks(soup))
-        parsed.extend(self._parse_from_text_blocks(soup))
+
+        table_entries = self._parse_from_tables(soup)
+        LOGGER.debug("Parsed %d entries from HTML tables", len(table_entries))
+        parsed.extend(table_entries)
+
+        structured_entries = self._parse_from_structured_blocks(soup)
+        LOGGER.debug("Parsed %d entries from structured blocks", len(structured_entries))
+        parsed.extend(structured_entries)
+
+        heading_entries = self._parse_from_heading_blocks(soup)
+        LOGGER.debug("Parsed %d entries from heading blocks", len(heading_entries))
+        parsed.extend(heading_entries)
+
+        paragraph_entries = self._parse_from_paragraph_blocks(soup)
+        LOGGER.debug("Parsed %d entries from paragraph blocks", len(paragraph_entries))
+        parsed.extend(paragraph_entries)
+
+        text_entries = self._parse_from_text_blocks(soup)
+        LOGGER.debug("Parsed %d entries from free text blocks", len(text_entries))
+        parsed.extend(text_entries)
+
         meaningful = [_normalise_entry(entry) for entry in parsed]
+        dropped = sum(1 for entry in meaningful if entry is None)
+        if dropped:
+            LOGGER.debug("Dropped %d entries during normalisation", dropped)
         return [entry for entry in meaningful if entry]
 
     def _parse_from_tables(self, soup: BeautifulSoup) -> list[MKBEntry]:
@@ -194,7 +225,7 @@ class MKBScraper:
         for table in soup.find_all("table"):
             for row in table.find_all("tr"):
                 cells = [
-                    _normalize_text(cell.get_text(" ", strip=True))
+                    _strip_labels(_normalize_text(cell.get_text(" ", strip=True)))
                     for cell in row.find_all(["td", "th"])
                 ]
                 if not cells or any("šifra" in cell.lower() for cell in cells):
@@ -204,8 +235,8 @@ class MKBScraper:
                 code = cells[0]
                 if not _is_code(code):
                     continue
-                serbian = cells[1]
-                latin = cells[2] if len(cells) >= 3 else ""
+                serbian = _strip_labels(cells[1])
+                latin = _strip_labels(cells[2]) if len(cells) >= 3 else ""
                 entries.append(MKBEntry(code=code, serbian=serbian, latin=latin))
         return entries
 
@@ -235,16 +266,20 @@ class MKBScraper:
                 exclude=code_element,
             )
 
-            code_text = _normalize_text(code_element.get_text(" ", strip=True)) if code_element else ""
+            code_text = (
+                _strip_labels(_normalize_text(code_element.get_text(" ", strip=True)))
+                if code_element
+                else ""
+            )
             if not _is_code(code_text):
                 continue
             serbian_text = (
-                _normalize_text(serbian_element.get_text(" ", strip=True))
+                _strip_labels(_normalize_text(serbian_element.get_text(" ", strip=True)))
                 if serbian_element
                 else ""
             )
             latin_text = (
-                _normalize_text(latin_element.get_text(" ", strip=True))
+                _strip_labels(_normalize_text(latin_element.get_text(" ", strip=True)))
                 if latin_element
                 else ""
             )
@@ -275,20 +310,20 @@ class MKBScraper:
             strong = paragraph.find(["strong", "b"])
             if not strong:
                 continue
-            code_text = _normalize_text(strong.get_text(" ", strip=True))
+            code_text = _strip_labels(_normalize_text(strong.get_text(" ", strip=True)))
             if not _is_code(code_text):
                 continue
             serbian_parts: list[str] = []
             latin_text = ""
             for node in strong.next_siblings:
                 if isinstance(node, str):
-                    candidate = _normalize_text(node)
+                    candidate = _strip_labels(_normalize_text(node))
                     if candidate:
                         serbian_parts.append(candidate)
                     continue
                 if node.name == "br":
                     continue
-                text = _normalize_text(node.get_text(" ", strip=True))
+                text = _strip_labels(_normalize_text(node.get_text(" ", strip=True)))
                 if not text:
                     continue
                 classes = " ".join(node.get("class", [])).lower()
@@ -312,7 +347,7 @@ class MKBScraper:
             if not match:
                 continue
             code = match.group("code")
-            rest = match.group("rest")
+            rest = _strip_labels(match.group("rest"))
             parts = [
                 part.strip()
                 for part in re.split(r"\s{2,}\|\s{2,}|\s{2,}|\s+-\s+|\s+–\s+", rest)
@@ -375,7 +410,7 @@ def _normalise_entry(entry: MKBEntry) -> Optional[MKBEntry]:
 
 
 _LABEL_PATTERN = re.compile(
-    r"^(?:srpski|serbian|naziv|opis|latinski|latin(?: name)?)\s*[:\-–]?\s*",
+    r"^(?:srpski|serbian|naziv|opis|latinski|latin(?: name)?|šifra|sifra|oznaka|code)\s*[:\-–]?\s*",
     re.IGNORECASE,
 )
 
