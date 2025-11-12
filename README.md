@@ -3,7 +3,9 @@
 It's just a csv with all the ICD-10 codes with serbian and latin descriptions. The format is as follows
 
 code|description_serbian|description_latin
+
 A00|Kolera NOVA|Cholera
+
 A00.0|Kolera, uzročnik Vibrio cholerae 01,biotip cholerae|Cholera classica
 etc.
 
